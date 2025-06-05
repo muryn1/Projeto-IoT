@@ -1,0 +1,245 @@
+  #include <Wire.h>
+  #include <Adafruit_ADS1X15.h>
+  #include <WiFi.h>
+  #include <PubSubClient.h>
+
+  Adafruit_ADS1015 ads;
+
+  // Configurações WiFi
+  const char* ssid = "Vodafone-A4AFF6";
+  const char* password = "5HC469DEYkd93q53";
+
+  // Configurações MQTT
+  const char* mqtt_server = "broker.emqx.io";
+  const int mqtt_port = 1883;
+  const char* mqtt_topic = "sensor/corrente";
+  const char* mqtt_status_topic = "sensor/status";
+  const char* mqtt_client_id = "ESP32_PowerMonitor";
+
+  // Configurações do sensor
+  const float VREF = 3.3;          // Tensão de referência
+  const float SCALE_FACTOR = 100; // 100A:1V
+  const int NUM_SAMPLES = 1480;     // Amostras para RMS
+  const float OFFSET = 1.66;        // Tensão de offset (VDD/2)
+
+  // Configurações do sistema
+  const long interval = 2000;       // Intervalo de envio (ms)
+  const int maxRetries = 3;         // Máximo de tentativas de envio
+  const int wifiReconnectInterval = 30000; // Intervalo para tentar reconectar WiFi (ms)
+
+  WiFiClient espClient;
+  PubSubClient client(espClient);
+
+  unsigned long lastMsgTime = 0;
+  unsigned long lastWifiCheck = 0;
+  unsigned long lastStatusUpdate = 0;
+
+  // Estrutura para mensagens pendentes
+  struct PendingMessage {
+    char topic[50];
+    char payload[50];
+    unsigned long timestamp;
+    int retries;
+  };
+
+  #define MAX_PENDING_MSGS 5
+  PendingMessage pendingMessages[MAX_PENDING_MSGS];
+  int pendingCount = 0;
+
+  void setup_wifi() {
+    delay(10);
+    Serial.println();
+    Serial.print("Conectando a ");
+    Serial.println(ssid);
+
+    WiFi.disconnect(true);  // Limpa configurações anteriores
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+
+    unsigned long startAttemptTime = millis();
+    
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
+      delay(500);
+      Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("");
+      Serial.println("WiFi conectado");
+      Serial.print("Endereço IP: ");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println("Falha na conexão WiFi");
+    }
+  }
+
+  bool ensureMqttConnection() {
+    if (!client.connected()) {
+      Serial.print("Conectando ao MQTT...");
+      
+      String clientId = mqtt_client_id;
+      clientId += String(random(0xffff), HEX);
+      
+      if (client.connect(clientId.c_str())) {
+        Serial.println("conectado");
+        // Publica mensagem de status
+        client.publish(mqtt_status_topic, "online", true);
+        return true;
+      } else {
+        Serial.print("falha, rc=");
+        Serial.print(client.state());
+        return false;
+      }
+    }
+    return true;
+  }
+
+  float applyLowPassFilter(float currentValue) {
+    static float filteredValue = 0;
+    const float alpha = 0.2; // Fator de suavização
+    
+    filteredValue = alpha * currentValue + (1 - alpha) * filteredValue;
+    return filteredValue;
+  }
+
+  float measureCurrentRMS() {
+    float sumSquares = 0;
+    int validSamples = 0;
+
+    for (int i = 0; i < NUM_SAMPLES; i++) {
+      int16_t adc = ads.readADC_SingleEnded(0);
+      if (adc != 0) {
+        float voltage = ads.computeVolts(adc) - OFFSET;
+        if (voltage > -2.0 && voltage < 2.0) {
+          sumSquares += voltage * voltage;
+          validSamples++;
+        }
+      }
+      delayMicroseconds(100);
+    }
+
+    if (validSamples == 0) return 0.0;
+    float rawRMS = sqrt(sumSquares / validSamples) * SCALE_FACTOR;
+    return applyLowPassFilter(rawRMS);
+  }
+
+  void addPendingMessage(const char* topic, const char* payload) {
+    if (pendingCount < MAX_PENDING_MSGS) {
+      strncpy(pendingMessages[pendingCount].topic, topic, 49);
+      strncpy(pendingMessages[pendingCount].payload, payload, 49);
+      pendingMessages[pendingCount].timestamp = millis();
+      pendingMessages[pendingCount].retries = 0;
+      pendingCount++;
+      Serial.println("Mensagem adicionada à fila de espera");
+    } else {
+      Serial.println("Fila de mensagens cheia. Descartando mensagem.");
+    }
+  }
+
+  void processPendingMessages() {
+    for (int i = 0; i < pendingCount; i++) {
+      if (millis() - pendingMessages[i].timestamp > 2000) {
+        if (client.publish(pendingMessages[i].topic, pendingMessages[i].payload)) {
+          Serial.println("Mensagem pendente enviada com sucesso");
+          // Remove mensagem da fila
+          for (int j = i; j < pendingCount-1; j++) {
+            pendingMessages[j] = pendingMessages[j+1];
+          }
+          pendingCount--;
+          i--;
+        } else {
+          pendingMessages[i].retries++;
+          pendingMessages[i].timestamp = millis();
+          if (pendingMessages[i].retries >= maxRetries) {
+            Serial.println("Máximo de tentativas para mensagem pendente");
+            for (int j = i; j < pendingCount-1; j++) {
+              pendingMessages[j] = pendingMessages[j+1];
+            }
+            pendingCount--;
+            i--;
+          }
+        }
+      }
+    }
+  }
+
+  void checkNetworkConnection() {
+    unsigned long now = millis();
+    
+    // Verifica conexão WiFi periodicamente
+    if (now - lastWifiCheck > wifiReconnectInterval) {
+      lastWifiCheck = now;
+      
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi desconectado. Tentando reconectar...");
+        WiFi.disconnect();
+        setup_wifi();
+      }
+    }
+    
+    // Atualiza status periódico
+    if (now - lastStatusUpdate > 60000) { // A cada 1 minuto
+      lastStatusUpdate = now;
+      if (client.connected()) {
+        client.publish(mqtt_status_topic, "online", true);
+      }
+    }
+  }
+
+  void setup() {
+    Serial.begin(115200);
+    
+    // Inicializa WiFi
+    setup_wifi();
+    
+    // Configura MQTT
+    client.setServer(mqtt_server, mqtt_port);
+    client.setBufferSize(2048);
+    client.setKeepAlive(60);
+    client.setSocketTimeout(30);
+    
+    // Inicializa ADS1015
+    Wire.begin();
+    if (!ads.begin(0x48)) {
+      Serial.println("Falha ao iniciar ADS1015!");
+      while (1);
+    }
+    ads.setGain(GAIN_TWO); // Configuração do ganho
+
+    Serial.println("Sistema iniciado. Aguardando medições...");
+  }
+
+  void loop() {
+    checkNetworkConnection();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!client.connected()) {
+        ensureMqttConnection();
+      }
+      client.loop();
+      processPendingMessages();
+    }
+
+    unsigned long now = millis();
+    if (now - lastMsgTime > interval) {
+      lastMsgTime = now;
+      
+      float Irms = measureCurrentRMS();
+      char msg[50];
+      snprintf(msg, 50, "%.2f", Irms);
+      
+      if (client.connected()) {
+        if (client.publish(mqtt_topic, msg, true)) { // QoS 1
+          Serial.print("Corrente RMS enviada: ");
+          Serial.print(Irms, 2);
+          Serial.println(" A");
+        } else {
+          Serial.println("Falha no envio. Adicionando à fila.");
+          addPendingMessage(mqtt_topic, msg);
+        }
+      } else {
+        Serial.println("MQTT desconectado. Adicionando à fila.");
+        addPendingMessage(mqtt_topic, msg);
+      }
+    }
+  }
